@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database with PostGIS
+  postgres:
+    image: postgis/postgis:16-3.3
+    container_name: waitwise-postgres
+    environment:
+      POSTGRES_USER: waitwise_user
+      POSTGRES_PASSWORD: waitwise_password
+      POSTGRES_DB: waitwise
+      POSTGRES_INITDB_ARGS: "-c timezone=UTC"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U waitwise_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - waitwise-network
+
+  # Redis Cache
+  redis:
+    image: redis:7.2-alpine
+    container_name: waitwise-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - waitwise-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: waitwise-backend
+    environment:
+      DATABASE_URL: postgresql://waitwise_user:waitwise_password@postgres:5432/waitwise
+      REDIS_URL: redis://redis:6379/0
+      ENV: development
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - waitwise-network
+
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: waitwise-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+    networks:
+      - waitwise-network
+
+volumes:
+  postgres_data:
+
+networks:
+  waitwise-network:
+    driver: bridge
