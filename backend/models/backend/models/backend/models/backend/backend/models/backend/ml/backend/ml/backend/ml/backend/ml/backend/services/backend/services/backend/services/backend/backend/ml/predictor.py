@@ -265,4 +265,74 @@ class CrowdPredictor:
         )
 
         # Confidence improves as more historical
-        # verified reports
+        # verified reports become available.
+
+        confidence = min(
+            95,
+            round(
+                40
+                + (
+                    min(
+                        self.training_samples,
+                        100
+                    )
+                    / 100
+                )
+                * 55
+            )
+        )
+
+        return {
+            "available": True,
+            "crowd_level": round(
+                predicted_crowd,
+                2
+            ),
+            "wait_time_minutes": round(
+                predicted_wait,
+                2
+            ),
+            "confidence": confidence,
+            "samples": self.training_samples,
+            "forecast_time": (
+                forecast_time.isoformat()
+            )
+        }
+
+    # =========================================================================
+    # MODEL STATUS
+    # =========================================================================
+
+    def get_status(
+        self,
+        location_id: str
+    ) -> dict:
+
+        reports = self.get_training_reports(
+            location_id
+        )
+
+        valid_reports = [
+            report
+            for report in reports
+            if (
+                report.created_at is not None
+                and report.crowd_level is not None
+            )
+        ]
+
+        sample_count = len(valid_reports)
+
+        return {
+            "location_id": location_id,
+            "verified_training_samples": sample_count,
+            "minimum_required": (
+                self.MIN_TRAINING_SAMPLES
+            ),
+            "ready_for_training": (
+                sample_count >= self.MIN_TRAINING_SAMPLES
+            ),
+            "model_type": (
+                "RandomForestRegressor"
+            )
+        }
