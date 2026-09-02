@@ -1,733 +1,469 @@
 from datetime import datetime, timedelta
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from ml.predictor import CrowdPredictor
-from ml.learner import CrowdLearner
-from ml.anomaly import CrowdAnomalyDetector
-
+from models.location import Location
 from services.crowd_service import CrowdService
+from ml.predictor import CrowdPredictor
 
 
 class ForecastService:
-
     """
-    WaitWise Forecast Intelligence Service.
+    Hybrid forecasting service.
 
-    Combines:
+    Priority:
 
-    - Current crowd intelligence
-    - ML crowd prediction
-    - Learning patterns
-    - Crowd anomaly detection
-    - Confidence calculation
-
-    This service creates the complete intelligence
-    response used by the WaitWise API and frontend.
+    1. Machine-learning prediction when enough verified data exists
+    2. Historical pattern prediction as fallback
+    3. Current crowd conditions influence near-future forecasts
     """
 
-    def __init__(self, session: Session):
+    def __init__(self, db: Session):
+        self.db = db
 
-        self.session = session
+        self.crowd_service = CrowdService(db)
+        self.predictor = CrowdPredictor(db)
 
-        self.crowd_service = CrowdService(
-            session
+    # =========================================================================
+    # LOCATION
+    # =========================================================================
+
+    def get_location(
+        self,
+        location_id: str
+    ) -> Optional[Location]:
+
+        return (
+            self.db.query(Location)
+            .filter(Location.id == location_id)
+            .first()
         )
 
-        self.predictor = CrowdPredictor(
-            session
+    # =========================================================================
+    # HISTORICAL FALLBACK
+    # =========================================================================
+
+    def historical_prediction(
+        self,
+        location_id: str,
+        forecast_time: datetime
+    ) -> dict:
+        """
+        Predict using verified historical reports.
+
+        Used when the ML model does not yet have enough
+        training samples.
+        """
+
+        reports = self.crowd_service.get_verified_reports(
+            location_id=location_id,
+            limit=500
         )
 
-        self.learner = CrowdLearner(
-            session
+        if not reports:
+
+            return {
+                "available": False,
+                "reason": "No verified historical data",
+                "crowd_level": None,
+                "wait_time_minutes": None,
+                "confidence": 0,
+                "prediction_method": "none"
+            }
+
+        target_hour = forecast_time.hour
+
+        # Find reports from approximately the same hour.
+        matching_reports = [
+            report
+            for report in reports
+            if (
+                report.created_at is not None
+                and abs(
+                    report.created_at.hour - target_hour
+                ) <= 1
+            )
+        ]
+
+        # If the hour-based sample is too small,
+        # use all verified history.
+
+        if len(matching_reports) < 3:
+            matching_reports = reports
+
+        crowd_values = [
+            report.crowd_level
+            for report in matching_reports
+            if report.crowd_level is not None
+        ]
+
+        wait_values = [
+            report.estimated_wait_minutes
+            for report in matching_reports
+            if report.estimated_wait_minutes is not None
+        ]
+
+        if not crowd_values:
+
+            return {
+                "available": False,
+                "reason": "No valid crowd values",
+                "crowd_level": None,
+                "wait_time_minutes": None,
+                "confidence": 0,
+                "prediction_method": "none"
+            }
+
+        predicted_crowd = (
+            sum(crowd_values)
+            / len(crowd_values)
         )
 
-        self.anomaly_detector = (
-            CrowdAnomalyDetector(
-                session
+        predicted_wait = (
+            sum(wait_values)
+            / len(wait_values)
+            if wait_values
+            else 0
+        )
+
+        confidence = min(
+            75,
+            round(
+                25
+                + min(
+                    len(matching_reports) * 2,
+                    50
+                )
             )
         )
 
-    # ========================================================================
-    # COMPLETE LOCATION FORECAST
-    # ========================================================================
+        return {
+            "available": True,
+
+            "crowd_level": round(
+                max(0, min(100, predicted_crowd)),
+                2
+            ),
+
+            "wait_time_minutes": round(
+                max(0, predicted_wait),
+                2
+            ),
+
+            "confidence": confidence,
+
+            "samples": len(matching_reports),
+
+            "prediction_method": "historical"
+        }
+
+    # =========================================================================
+    # CURRENT CONDITIONS ADJUSTMENT
+    # =========================================================================
+
+    def apply_current_conditions(
+        self,
+        prediction: dict,
+        location_id: str,
+        forecast_time: datetime
+    ) -> dict:
+        """
+        Blend near-future predictions with current
+        real-world crowd conditions.
+
+        Current observations matter more for forecasts
+        that are closer in time.
+        """
+
+        if not prediction.get("available"):
+            return prediction
+
+        current = self.crowd_service.get_current_crowd(
+            location_id=location_id,
+            hours=6
+        )
+
+        if (
+            not current.get("available")
+            or current.get("crowd_level") is None
+        ):
+            return prediction
+
+        hours_ahead = max(
+            0,
+            (
+                forecast_time
+                - datetime.utcnow()
+            ).total_seconds() / 3600
+        )
+
+        # Current conditions influence the near future
+        # strongly and gradually lose influence.
+
+        current_weight = max(
+            0.10,
+            min(
+                0.70,
+                0.70 - (hours_ahead * 0.08)
+            )
+        )
+
+        prediction_weight = (
+            1 - current_weight
+        )
+
+        predicted_crowd = (
+            current["crowd_level"]
+            * current_weight
+            +
+            prediction["crowd_level"]
+            * prediction_weight
+        )
+
+        current_wait = (
+            current.get("wait_time_minutes")
+        )
+
+        predicted_wait = (
+            prediction.get("wait_time_minutes", 0)
+        )
+
+        if current_wait is not None:
+
+            predicted_wait = (
+                current_wait
+                * current_weight
+                +
+                predicted_wait
+                * prediction_weight
+            )
+
+        prediction["crowd_level"] = round(
+            max(0, min(100, predicted_crowd)),
+            2
+        )
+
+        prediction["wait_time_minutes"] = round(
+            max(0, predicted_wait),
+            2
+        )
+
+        prediction["current_conditions_used"] = True
+
+        prediction["current_conditions_weight"] = round(
+            current_weight,
+            2
+        )
+
+        return prediction
+
+    # =========================================================================
+    # MAIN PREDICTION
+    # =========================================================================
+
+    def predict_crowd_level(
+        self,
+        location_id: str,
+        forecast_time: datetime
+    ) -> dict:
+        """
+        Generate a hybrid prediction.
+
+        First tries ML.
+
+        If ML does not have enough verified data,
+        automatically falls back to historical analysis.
+        """
+
+        location = self.get_location(location_id)
+
+        if not location:
+
+            return {
+                "available": False,
+                "reason": "Location not found",
+                "crowd_level": None,
+                "wait_time_minutes": None,
+                "confidence": 0
+            }
+
+        # ---------------------------------------------------------------------
+        # STEP 1 — TRY MACHINE LEARNING
+        # ---------------------------------------------------------------------
+
+        ml_prediction = self.predictor.predict(
+            location_id=location_id,
+            forecast_time=forecast_time
+        )
+
+        if ml_prediction.get("available"):
+
+            prediction = ml_prediction
+
+            prediction["prediction_method"] = "machine_learning"
+
+        else:
+
+            # -----------------------------------------------------------------
+            # STEP 2 — HISTORICAL FALLBACK
+            # -----------------------------------------------------------------
+
+            prediction = self.historical_prediction(
+                location_id=location_id,
+                forecast_time=forecast_time
+            )
+
+        # ---------------------------------------------------------------------
+        # STEP 3 — APPLY CURRENT REAL-WORLD CONDITIONS
+        # ---------------------------------------------------------------------
+
+        prediction = self.apply_current_conditions(
+            prediction=prediction,
+            location_id=location_id,
+            forecast_time=forecast_time
+        )
+
+        prediction["location_id"] = str(location.id)
+
+        prediction["location_name"] = location.name
+
+        prediction["forecast_time"] = (
+            forecast_time.isoformat()
+        )
+
+        return prediction
+
+    # =========================================================================
+    # LOCATION FORECAST
+    # =========================================================================
 
     def get_location_forecast(
         self,
-        location_id,
-        hours=4
-    ):
+        location_id: str,
+        hours: int = 6
+    ) -> dict:
+        """
+        Generate a complete hourly forecast.
+        """
 
-        # --------------------------------------------------------------------
-        # CURRENT CROWD
-        # --------------------------------------------------------------------
+        location = self.get_location(location_id)
 
-        current_crowd = (
+        if not location:
 
-            self.crowd_service
-            .get_current_crowd(
-                location_id
-            )
+            return {
+                "available": False,
+                "reason": "Location not found",
+                "forecasts": []
+            }
 
+        current = self.crowd_service.get_current_crowd(
+            location_id=location_id,
+            hours=6
         )
 
-        # --------------------------------------------------------------------
-        # CURRENT TREND
-        # --------------------------------------------------------------------
-
-        trend = (
-
-            self.crowd_service
-            .get_crowd_trend(
-                location_id
-            )
-
+        trend = self.crowd_service.get_crowd_trend(
+            location_id=location_id,
+            hours=6
         )
 
-        # --------------------------------------------------------------------
-        # ANOMALY ANALYSIS
-        # --------------------------------------------------------------------
-
-        anomaly = (
-
-            self.anomaly_detector
-            .analyze(
-                location_id
-            )
-
-        )
-
-        # --------------------------------------------------------------------
-        # FUTURE PREDICTIONS
-        # --------------------------------------------------------------------
-
-        predictions = self.get_forecast_timeline(
-
-            location_id,
-
-            hours
-
-        )
-
-        # --------------------------------------------------------------------
-        # BEST TIME TO VISIT
-        # --------------------------------------------------------------------
-
-        best_time = (
-
-            self.get_best_time_to_visit(
-                predictions
-            )
-
-        )
-
-        # --------------------------------------------------------------------
-        # PEAK TIME
-        # --------------------------------------------------------------------
-
-        peak_time = (
-
-            self.get_peak_time(
-                predictions
-            )
-
-        )
-
-        # --------------------------------------------------------------------
-        # OVERALL RECOMMENDATION
-        # --------------------------------------------------------------------
-
-        recommendation = (
-
-            self._generate_recommendation(
-
-                current_crowd,
-
-                trend,
-
-                anomaly,
-
-                best_time
-
-            )
-
-        )
-
-        return {
-
-            "location_id":
-            str(location_id),
-
-            "generated_at":
-            datetime.utcnow().isoformat(),
-
-            "current":
-            current_crowd,
-
-            "trend":
-            trend,
-
-            "anomaly":
-            anomaly,
-
-            "forecast":
-            predictions,
-
-            "best_time":
-            best_time,
-
-            "peak_time":
-            peak_time,
-
-            "recommendation":
-            recommendation
-
-        }
-
-    # ========================================================================
-    # FORECAST TIMELINE
-    # ========================================================================
-
-    def get_forecast_timeline(
-
-        self,
-
-        location_id,
-
-        hours=4
-
-    ):
-
-        predictions = []
+        forecasts = []
 
         now = datetime.utcnow()
 
-        for hour_offset in range(
-            hours + 1
-        ):
+        for hour_offset in range(1, hours + 1):
 
             forecast_time = (
-
                 now
-
-                +
-
-                timedelta(
-                    hours=hour_offset
-                )
-
+                + timedelta(hours=hour_offset)
             )
 
-            prediction = (
-
-                self.predictor.predict(
-
-                    location_id,
-
-                    forecast_time
-
-                )
-
+            prediction = self.predict_crowd_level(
+                location_id=location_id,
+                forecast_time=forecast_time
             )
 
-            formatted_prediction = {
+            if prediction.get("available"):
 
-                "time":
+                forecasts.append(prediction)
 
-                forecast_time.isoformat(),
+        # ---------------------------------------------------------------------
+        # FIND BEST TIME
+        # ---------------------------------------------------------------------
 
-                "hour_offset":
+        best_time = None
 
-                hour_offset,
+        if forecasts:
 
-                "crowd_level":
-
-                prediction.get(
+            best_forecast = min(
+                forecasts,
+                key=lambda item: item[
                     "crowd_level"
-                ),
+                ]
+            )
 
-                "wait_time_minutes":
+            best_time = {
+                "time": best_forecast[
+                    "forecast_time"
+                ],
 
-                prediction.get(
+                "crowd_level": best_forecast[
+                    "crowd_level"
+                ],
+
+                "wait_time_minutes": best_forecast[
                     "wait_time_minutes"
-                ),
+                ],
 
-                "confidence":
-
-                prediction.get(
+                "confidence": best_forecast[
                     "confidence"
-                ),
+                ],
 
-                "status":
-
-                self._crowd_level_to_status(
-
-                    prediction.get(
-                        "crowd_level"
-                    )
-
+                "prediction_method": best_forecast.get(
+                    "prediction_method"
                 )
-
             }
 
-            predictions.append(
-                formatted_prediction
-            )
+        # ---------------------------------------------------------------------
+        # DETERMINE PRIMARY PREDICTION METHOD
+        # ---------------------------------------------------------------------
 
-        return predictions
-
-    # ========================================================================
-    # BEST TIME TO VISIT
-    # ========================================================================
-
-    def get_best_time_to_visit(
-        self,
-        predictions
-    ):
-
-        if not predictions:
-
-            return None
-
-        valid_predictions = [
-
-            prediction
-
-            for prediction
-            in predictions
-
-            if prediction.get(
-                "crowd_level"
-            )
-            is not None
-
+        methods = [
+            forecast.get("prediction_method")
+            for forecast in forecasts
         ]
 
-        if not valid_predictions:
+        if "machine_learning" in methods:
 
-            return None
+            primary_method = "hybrid_ml"
 
-        best = min(
+        elif "historical" in methods:
 
-            valid_predictions,
+            primary_method = "historical"
 
-            key=lambda prediction:
+        else:
 
-            prediction[
-                "crowd_level"
-            ]
-
-        )
+            primary_method = "insufficient_data"
 
         return {
+            "available": True,
 
-            "time":
-            best["time"],
+            "location": {
+                "id": str(location.id),
+                "name": location.name,
+                "category": location.category,
+                "city": location.city
+            },
 
-            "hour_offset":
-            best["hour_offset"],
+            "current": current,
 
-            "predicted_crowd":
-            best["crowd_level"],
+            "trend": trend,
 
-            "predicted_wait":
-            best["wait_time_minutes"],
+            "forecast_hours": hours,
 
-            "confidence":
-            best["confidence"]
+            "prediction_method": primary_method,
 
+            "forecasts": forecasts,
+
+            "best_time": best_time
         }
-
-    # ========================================================================
-    # PEAK TIME DETECTION
-    # ========================================================================
-
-    def get_peak_time(
-        self,
-        predictions
-    ):
-
-        if not predictions:
-
-            return None
-
-        valid_predictions = [
-
-            prediction
-
-            for prediction
-            in predictions
-
-            if prediction.get(
-                "crowd_level"
-            )
-            is not None
-
-        ]
-
-        if not valid_predictions:
-
-            return None
-
-        peak = max(
-
-            valid_predictions,
-
-            key=lambda prediction:
-
-            prediction[
-                "crowd_level"
-            ]
-
-        )
-
-        return {
-
-            "time":
-            peak["time"],
-
-            "hour_offset":
-            peak["hour_offset"],
-
-            "predicted_crowd":
-            peak["crowd_level"],
-
-            "predicted_wait":
-            peak["wait_time_minutes"],
-
-            "confidence":
-            peak["confidence"]
-
-        }
-
-    # ========================================================================
-    # QUICK FORECAST
-    # ========================================================================
-
-    def get_quick_forecast(
-        self,
-        location_id
-    ):
-
-        predictions = (
-
-            self.get_forecast_timeline(
-
-                location_id,
-
-                hours=2
-
-            )
-
-        )
-
-        return {
-
-            "now":
-
-            predictions[0]
-            if len(predictions) > 0
-            else None,
-
-            "in_1_hour":
-
-            predictions[1]
-            if len(predictions) > 1
-            else None,
-
-            "in_2_hours":
-
-            predictions[2]
-            if len(predictions) > 2
-            else None
-
-        }
-
-    # ========================================================================
-    # FORECAST CONFIDENCE
-    # ========================================================================
-
-    def calculate_forecast_confidence(
-
-        self,
-
-        location_id,
-
-        predictions
-
-    ):
-
-        if not predictions:
-
-            return 0.0
-
-        confidence_values = [
-
-            prediction.get(
-                "confidence",
-                0
-            )
-
-            for prediction
-            in predictions
-
-            if prediction.get(
-                "confidence"
-            )
-            is not None
-
-        ]
-
-        if not confidence_values:
-
-            return 0.0
-
-        average_confidence = (
-
-            sum(confidence_values)
-
-            /
-
-            len(confidence_values)
-
-        )
-
-        return round(
-            average_confidence,
-            3
-        )
-
-    # ========================================================================
-    # GENERATE HUMAN RECOMMENDATION
-    # ========================================================================
-
-    def _generate_recommendation(
-
-        self,
-
-        current_crowd,
-
-        trend,
-
-        anomaly,
-
-        best_time
-
-    ):
-
-        crowd_level = (
-
-            current_crowd.get(
-                "crowd_level"
-            )
-
-        )
-
-        crowd_trend = (
-
-            trend.get(
-                "trend"
-            )
-
-        )
-
-        anomaly_detected = (
-
-            anomaly.get(
-                "anomaly_detected",
-                False
-            )
-
-        )
-
-        anomaly_status = (
-
-            anomaly.get(
-                "status",
-                "normal"
-            )
-
-        )
-
-        # --------------------------------------------------------------------
-        # NO DATA
-        # --------------------------------------------------------------------
-
-        if crowd_level is None:
-
-            return {
-
-                "decision":
-                "unknown",
-
-                "message":
-
-                "Not enough recent crowd data is "
-
-                "available for a reliable recommendation."
-
-            }
-
-        # --------------------------------------------------------------------
-        # CRITICAL ANOMALY
-        # --------------------------------------------------------------------
-
-        if (
-
-            anomaly_detected
-
-            and
-
-            anomaly_status
-            in ["critical", "high"]
-
-        ):
-
-            return {
-
-                "decision":
-                "avoid",
-
-                "message":
-
-                "Unusual crowd activity has been "
-
-                "detected. Consider avoiding this "
-
-                "location temporarily.",
-
-                "reason":
-                "crowd_anomaly"
-
-            }
-
-        # --------------------------------------------------------------------
-        # VERY HIGH CROWD
-        # --------------------------------------------------------------------
-
-        if crowd_level >= 4.5:
-
-            return {
-
-                "decision":
-                "avoid",
-
-                "message":
-
-                "This location is currently extremely "
-
-                "crowded. Waiting may be significant.",
-
-                "reason":
-                "very_high_crowd"
-
-            }
-
-        # --------------------------------------------------------------------
-        # HIGH AND INCREASING
-        # --------------------------------------------------------------------
-
-        if (
-
-            crowd_level >= 3.5
-
-            and
-
-            crowd_trend == "increasing"
-
-        ):
-
-            return {
-
-                "decision":
-                "wait",
-
-                "message":
-
-                "Crowds are increasing. It may be "
-
-                "better to visit later.",
-
-                "best_time":
-                best_time,
-
-                "reason":
-                "increasing_crowd"
-
-            }
-
-        # --------------------------------------------------------------------
-        # LOW CROWD
-        # --------------------------------------------------------------------
-
-        if crowd_level <= 2.5:
-
-            return {
-
-                "decision":
-                "go_now",
-
-                "message":
-
-                "Current crowd conditions look good. "
-
-                "This is a good time to visit.",
-
-                "reason":
-                "low_crowd"
-
-            }
-
-        # --------------------------------------------------------------------
-        # MODERATE CROWD
-        # --------------------------------------------------------------------
-
-        return {
-
-            "decision":
-            "consider",
-
-            "message":
-
-            "Crowd levels are moderate. Your decision "
-
-            "may depend on your waiting preference.",
-
-            "best_time":
-            best_time,
-
-            "reason":
-            "moderate_crowd"
-
-        }
-
-    # ========================================================================
-    # CROWD LEVEL → STATUS
-    # ========================================================================
-
-    def _crowd_level_to_status(
-        self,
-        crowd_level
-    ):
-
-        if crowd_level is None:
-
-            return "unknown"
-
-        if crowd_level < 1.5:
-
-            return "very_low"
-
-        elif crowd_level < 2.5:
-
-            return "low"
-
-        elif crowd_level < 3.5:
-
-            return "moderate"
-
-        elif crowd_level < 4.5:
-
-            return "high"
-
-        return "very_high"
