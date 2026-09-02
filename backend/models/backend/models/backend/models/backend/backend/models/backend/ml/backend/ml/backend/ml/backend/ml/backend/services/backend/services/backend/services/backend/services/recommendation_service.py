@@ -1,756 +1,318 @@
+from typing import Optional
+
 from sqlalchemy.orm import Session
 
 from models.location import Location
-
-from services.crowd_service import CrowdService
 from services.forecast_service import ForecastService
 
 
 class RecommendationService:
-
     """
-    WaitWise Smart Recommendation Engine.
-
-    Evaluates locations and recommends the best
-    available option based on:
-
-    - Current crowd level
-    - Expected waiting time
-    - Crowd trend
-    - Future forecast
-    - Crowd anomalies
-    - User preferences
-
-    The scoring system is intentionally explainable.
-    Every recommendation includes the reason behind
-    the decision.
+    Converts crowd forecasts into practical recommendations.
     """
 
-    def __init__(self, session: Session):
+    def __init__(self, db: Session):
+        self.db = db
+        self.forecast_service = ForecastService(db)
 
-        self.session = session
+    # =========================================================================
+    # LOCATION
+    # =========================================================================
 
-        self.crowd_service = CrowdService(
-            session
-        )
-
-        self.forecast_service = ForecastService(
-            session
-        )
-
-    # ========================================================================
-    # GET RECOMMENDATIONS
-    # ========================================================================
-
-    def get_recommendations(
-
+    def get_location(
         self,
+        location_id: str
+    ) -> Optional[Location]:
 
-        limit=5,
-
-        category=None,
-
-        max_wait=None,
-
-        preferred_location_id=None
-
-    ):
-
-        query = self.session.query(
-            Location
+        return (
+            self.db.query(Location)
+            .filter(Location.id == location_id)
+            .first()
         )
 
-        # --------------------------------------------------------------------
-        # FILTER BY CATEGORY
-        # --------------------------------------------------------------------
+    # =========================================================================
+    # CROWD STATUS
+    # =========================================================================
 
-        if category:
+    @staticmethod
+    def get_crowd_status(crowd_level: float) -> str:
 
-            query = query.filter(
-                Location.category == category
+        if crowd_level < 30:
+            return "low"
+
+        if crowd_level < 60:
+            return "moderate"
+
+        if crowd_level < 80:
+            return "high"
+
+        return "very_high"
+
+    # =========================================================================
+    # MAIN RECOMMENDATION
+    # =========================================================================
+
+    def get_recommendation(
+        self,
+        location_id: str,
+        hours: int = 6
+    ) -> dict:
+
+        location = self.get_location(location_id)
+
+        if not location:
+
+            return {
+                "available": False,
+                "reason": "Location not found"
+            }
+
+        forecast = self.forecast_service.get_location_forecast(
+            location_id=location_id,
+            hours=hours
+        )
+
+        current = forecast.get("current") or {}
+        trend = forecast.get("trend") or {}
+        best_time = forecast.get("best_time")
+        forecasts = forecast.get("forecasts") or []
+
+        # ---------------------------------------------------------------------
+        # NO DATA
+        # ---------------------------------------------------------------------
+
+        if not current.get("available"):
+
+            return {
+                "available": False,
+                "location": {
+                    "id": str(location.id),
+                    "name": location.name,
+                    "category": location.category,
+                    "city": location.city
+                },
+                "recommendation": "insufficient_data",
+                "title": "Not enough reliable data",
+                "message": (
+                    "WaitWise does not yet have enough verified "
+                    "crowd information to make a reliable recommendation."
+                ),
+                "confidence": 0,
+                "best_time": None
+            }
+
+        crowd_level = current.get("crowd_level", 0)
+        wait_time = current.get("wait_time_minutes", 0)
+        confidence = current.get("confidence", 0)
+
+        trend_direction = trend.get(
+            "direction",
+            "stable"
+        )
+
+        crowd_status = self.get_crowd_status(
+            crowd_level
+        )
+
+        # ---------------------------------------------------------------------
+        # DECISION ENGINE
+        # ---------------------------------------------------------------------
+
+        recommendation = "go_now"
+        title = "Good time to visit"
+        message = (
+            f"{location.name} currently has a manageable crowd level."
+        )
+        priority = "low"
+
+        # VERY HIGH CROWD
+        if crowd_level >= 80:
+
+            recommendation = "avoid_for_now"
+            title = "Avoid for now"
+            message = (
+                f"{location.name} is currently very crowded. "
+                "Waiting for a better time is recommended."
+            )
+            priority = "high"
+
+        # HIGH CROWD
+        elif crowd_level >= 60:
+
+            recommendation = "consider_waiting"
+            title = "Consider waiting"
+            message = (
+                f"{location.name} is currently fairly crowded."
+            )
+            priority = "medium"
+
+        # CROWD INCREASING
+        if trend_direction == "rapidly_increasing":
+
+            recommendation = "go_soon_or_wait"
+            title = "Crowd is rising quickly"
+            message = (
+                f"Crowd levels at {location.name} are rising rapidly. "
+                "Visit soon if you need to go now, or wait for a later "
+                "low-crowd period."
+            )
+            priority = "high"
+
+        elif trend_direction == "increasing":
+
+            if recommendation == "go_now":
+
+                recommendation = "go_soon"
+                title = "Go soon"
+                message = (
+                    f"Crowd levels at {location.name} are increasing."
+                )
+                priority = "medium"
+
+        # CROWD DECREASING
+        elif trend_direction == "rapidly_decreasing":
+
+            recommendation = "wait_for_improvement"
+            title = "Crowd is dropping"
+            message = (
+                f"Crowd levels at {location.name} are decreasing rapidly. "
+                "Waiting could give you a much better experience."
+            )
+            priority = "medium"
+
+        elif trend_direction == "decreasing":
+
+            if crowd_level >= 60:
+
+                recommendation = "wait_a_little"
+                title = "Conditions are improving"
+                message = (
+                    f"Crowd levels at {location.name} are gradually "
+                    "decreasing."
+                )
+                priority = "low"
+
+        # ---------------------------------------------------------------------
+        # BEST TIME INSIGHT
+        # ---------------------------------------------------------------------
+
+        best_time_message = None
+        improvement = None
+
+        if best_time and best_time.get("crowd_level") is not None:
+
+            best_crowd = best_time["crowd_level"]
+
+            improvement = round(
+                crowd_level - best_crowd,
+                2
             )
 
-        locations = query.all()
+            if improvement >= 10:
+
+                best_time_message = (
+                    f"Waiting until the predicted best time could reduce "
+                    f"crowd levels by approximately {round(improvement)}%."
+                )
+
+        # ---------------------------------------------------------------------
+        # SCORE
+        #
+        # Higher score = better time to visit.
+        # ---------------------------------------------------------------------
+
+        recommendation_score = max(
+            0,
+            min(
+                100,
+                round(
+                    100
+                    - (crowd_level * 0.7)
+                    - (wait_time * 0.5)
+                )
+            )
+        )
+
+        # ---------------------------------------------------------------------
+        # RESPONSE
+        # ---------------------------------------------------------------------
+
+        return {
+            "available": True,
+
+            "location": {
+                "id": str(location.id),
+                "name": location.name,
+                "category": location.category,
+                "city": location.city
+            },
+
+            "recommendation": recommendation,
+
+            "title": title,
+
+            "message": message,
+
+            "priority": priority,
+
+            "recommendation_score": recommendation_score,
+
+            "current_conditions": {
+                "crowd_level": round(crowd_level, 2),
+                "crowd_status": crowd_status,
+                "wait_time_minutes": round(wait_time, 2),
+                "confidence": confidence,
+                "trend": trend_direction
+            },
+
+            "best_time": best_time,
+
+            "best_time_insight": best_time_message,
+
+            "forecast_count": len(forecasts)
+        }
+
+    # =========================================================================
+    # MULTIPLE LOCATION RECOMMENDATIONS
+    # =========================================================================
+
+    def compare_locations(
+        self,
+        location_ids: list[str],
+        hours: int = 6
+    ) -> dict:
 
         recommendations = []
 
-        for location in locations:
+        for location_id in location_ids:
 
-            result = self.evaluate_location(
-
-                location,
-
-                max_wait=max_wait,
-
-                preferred_location_id=
-                preferred_location_id
-
+            recommendation = self.get_recommendation(
+                location_id=location_id,
+                hours=hours
             )
 
-            recommendations.append(
-                result
-            )
+            if recommendation.get("available"):
 
-        # --------------------------------------------------------------------
-        # SORT BY SMART SCORE
-        # --------------------------------------------------------------------
+                recommendations.append(
+                    recommendation
+                )
 
         recommendations.sort(
-
-            key=lambda item:
-            item["smart_score"],
-
+            key=lambda item: item[
+                "recommendation_score"
+            ],
             reverse=True
-
         )
 
-        return recommendations[:limit]
-
-    # ========================================================================
-    # EVALUATE SINGLE LOCATION
-    # ========================================================================
-
-    def evaluate_location(
-
-        self,
-
-        location,
-
-        max_wait=None,
-
-        preferred_location_id=None
-
-    ):
-
-        location_id = location.id
-
-        # --------------------------------------------------------------------
-        # GET CURRENT CROWD
-        # --------------------------------------------------------------------
-
-        current = (
-
-            self.crowd_service
-            .get_current_crowd(
-                location_id
-            )
-
-        )
-
-        # --------------------------------------------------------------------
-        # GET TREND
-        # --------------------------------------------------------------------
-
-        trend = (
-
-            self.crowd_service
-            .get_crowd_trend(
-                location_id
-            )
-
-        )
-
-        # --------------------------------------------------------------------
-        # GET FORECAST
-        # --------------------------------------------------------------------
-
-        forecast = (
-
-            self.forecast_service
-            .get_quick_forecast(
-                location_id
-            )
-
-        )
-
-        # --------------------------------------------------------------------
-        # GET FULL FORECAST INTELLIGENCE
-        # --------------------------------------------------------------------
-
-        intelligence = (
-
-            self.forecast_service
-            .get_location_forecast(
-
-                location_id,
-
-                hours=2
-
-            )
-
-        )
-
-        anomaly = intelligence.get(
-            "anomaly",
-            {}
-        )
-
-        # --------------------------------------------------------------------
-        # CALCULATE SCORE
-        # --------------------------------------------------------------------
-
-        scoring = self._calculate_score(
-
-            current=current,
-
-            trend=trend,
-
-            forecast=forecast,
-
-            anomaly=anomaly,
-
-            max_wait=max_wait,
-
-            preferred_location_id=
-            preferred_location_id,
-
-            location_id=location_id
-
-        )
-
-        # --------------------------------------------------------------------
-        # CREATE EXPLANATION
-        # --------------------------------------------------------------------
-
-        explanation = (
-
-            self._generate_explanation(
-
-                current=current,
-
-                trend=trend,
-
-                anomaly=anomaly,
-
-                scoring=scoring
-
-            )
-
+        best_option = (
+            recommendations[0]
+            if recommendations
+            else None
         )
 
         return {
-
-            "location_id":
-            str(location.id),
-
-            "location_name":
-            location.name,
-
-            "category":
-            location.category,
-
-            "latitude":
-            float(location.latitude)
-            if location.latitude is not None
-            else None,
-
-            "longitude":
-            float(location.longitude)
-            if location.longitude is not None
-            else None,
-
-            "current":
-            current,
-
-            "trend":
-            trend,
-
-            "forecast":
-            forecast,
-
-            "anomaly":
-            anomaly,
-
-            "smart_score":
-            scoring["score"],
-
-            "score_breakdown":
-            scoring["breakdown"],
-
-            "recommendation":
-            explanation
-
-        }
-
-    # ========================================================================
-    # SMART SCORING ENGINE
-    # ========================================================================
-
-    def _calculate_score(
-
-        self,
-
-        current,
-
-        trend,
-
-        forecast,
-
-        anomaly,
-
-        max_wait,
-
-        preferred_location_id,
-
-        location_id
-
-    ):
-
-        score = 100.0
-
-        breakdown = {}
-
-        # --------------------------------------------------------------------
-        # CROWD SCORE
-        # --------------------------------------------------------------------
-
-        crowd_level = current.get(
-            "crowd_level"
-        )
-
-        if crowd_level is None:
-
-            crowd_penalty = 20
-
-        else:
-
-            crowd_penalty = (
-                crowd_level - 1
-            ) * 12
-
-        score -= crowd_penalty
-
-        breakdown["crowd_penalty"] = round(
-            crowd_penalty,
-            2
-        )
-
-        # --------------------------------------------------------------------
-        # WAIT TIME SCORE
-        # --------------------------------------------------------------------
-
-        wait_time = current.get(
-            "wait_time_minutes"
-        )
-
-        if wait_time is None:
-
-            wait_penalty = 5
-
-        else:
-
-            wait_penalty = min(
-                30,
-                wait_time * 0.8
-            )
-
-        score -= wait_penalty
-
-        breakdown["wait_penalty"] = round(
-            wait_penalty,
-            2
-        )
-
-        # --------------------------------------------------------------------
-        # USER MAX WAIT PREFERENCE
-        # --------------------------------------------------------------------
-
-        preference_penalty = 0
-
-        if (
-
-            max_wait is not None
-
-            and
-
-            wait_time is not None
-
-            and
-
-            wait_time > max_wait
-
-        ):
-
-            preference_penalty = min(
-
-                25,
-
-                (
-                    wait_time
-                    - max_wait
-                )
-                * 2
-
-            )
-
-            score -= preference_penalty
-
-        breakdown[
-            "preference_penalty"
-        ] = round(
-            preference_penalty,
-            2
-        )
-
-        # --------------------------------------------------------------------
-        # CROWD TREND
-        # --------------------------------------------------------------------
-
-        trend_name = trend.get(
-            "trend",
-            "unknown"
-        )
-
-        trend_penalty = 0
-
-        if trend_name == "increasing":
-
-            trend_penalty = 12
-
-        elif trend_name == "stable":
-
-            trend_penalty = 3
-
-        elif trend_name == "decreasing":
-
-            trend_penalty = -5
-
-        score -= trend_penalty
-
-        breakdown[
-            "trend_penalty"
-        ] = trend_penalty
-
-        # --------------------------------------------------------------------
-        # FUTURE FORECAST
-        # --------------------------------------------------------------------
-
-        future_penalty = 0
-
-        in_one_hour = forecast.get(
-            "in_1_hour"
-        )
-
-        now_forecast = forecast.get(
-            "now"
-        )
-
-        if (
-
-            now_forecast
-
-            and
-
-            in_one_hour
-
-        ):
-
-            current_prediction = (
-                now_forecast.get(
-                    "crowd_level"
-                )
-            )
-
-            future_prediction = (
-                in_one_hour.get(
-                    "crowd_level"
-                )
-            )
-
-            if (
-
-                current_prediction is not None
-
-                and
-
-                future_prediction is not None
-
-            ):
-
-                change = (
-
-                    future_prediction
-
-                    -
-
-                    current_prediction
-
-                )
-
-                if change > 0:
-
-                    future_penalty = min(
-                        15,
-                        change * 10
-                    )
-
-                    score -= future_penalty
-
-                elif change < 0:
-
-                    future_penalty = max(
-                        -8,
-                        change * 5
-                    )
-
-                    score -= future_penalty
-
-        breakdown[
-            "future_crowd_penalty"
-        ] = round(
-            future_penalty,
-            2
-        )
-
-        # --------------------------------------------------------------------
-        # ANOMALY PENALTY
-        # --------------------------------------------------------------------
-
-        anomaly_penalty = 0
-
-        if anomaly.get(
-            "anomaly_detected",
-            False
-        ):
-
-            anomaly_score = anomaly.get(
-                "anomaly_score",
-                0
-            )
-
-            anomaly_penalty = (
-                anomaly_score * 25
-            )
-
-            score -= anomaly_penalty
-
-        breakdown[
-            "anomaly_penalty"
-        ] = round(
-            anomaly_penalty,
-            2
-        )
-
-        # --------------------------------------------------------------------
-        # PREFERRED LOCATION BONUS
-        # --------------------------------------------------------------------
-
-        preference_bonus = 0
-
-        if (
-
-            preferred_location_id
-
-            and
-
-            str(location_id)
-            == str(preferred_location_id)
-
-        ):
-
-            preference_bonus = 5
-
-            score += preference_bonus
-
-        breakdown[
-            "preference_bonus"
-        ] = preference_bonus
-
-        # --------------------------------------------------------------------
-        # DATA CONFIDENCE
-        # --------------------------------------------------------------------
-
-        confidence = current.get(
-            "confidence",
-            0
-        )
-
-        confidence_bonus = (
-            confidence * 5
-        )
-
-        score += confidence_bonus
-
-        breakdown[
-            "confidence_bonus"
-        ] = round(
-            confidence_bonus,
-            2
-        )
-
-        # --------------------------------------------------------------------
-        # FINAL SCORE LIMIT
-        # --------------------------------------------------------------------
-
-        score = max(
-            0,
-            min(100, score)
-        )
-
-        return {
-
-            "score":
-            round(score, 2),
-
-            "breakdown":
-            breakdown
-
-        }
-
-    # ========================================================================
-    # HUMAN EXPLANATION ENGINE
-    # ========================================================================
-
-    def _generate_explanation(
-
-        self,
-
-        current,
-
-        trend,
-
-        anomaly,
-
-        scoring
-
-    ):
-
-        score = scoring["score"]
-
-        crowd_level = current.get(
-            "crowd_level"
-        )
-
-        wait_time = current.get(
-            "wait_time_minutes"
-        )
-
-        trend_name = trend.get(
-            "trend",
-            "unknown"
-        )
-
-        anomaly_detected = anomaly.get(
-            "anomaly_detected",
-            False
-        )
-
-        # --------------------------------------------------------------------
-        # BEST CHOICE
-        # --------------------------------------------------------------------
-
-        if score >= 80:
-
-            decision = "excellent"
-
-            message = (
-                "This is currently one of the "
-                "best choices available."
-            )
-
-        elif score >= 65:
-
-            decision = "recommended"
-
-            message = (
-                "This location currently has "
-                "good overall conditions."
-            )
-
-        elif score >= 45:
-
-            decision = "consider"
-
-            message = (
-                "Conditions are acceptable, but "
-                "there may be better alternatives."
-            )
-
-        else:
-
-            decision = "avoid"
-
-            message = (
-                "Current conditions are not ideal. "
-                "Consider another location."
-            )
-
-        reasons = []
-
-        # --------------------------------------------------------------------
-        # CROWD REASON
-        # --------------------------------------------------------------------
-
-        if crowd_level is not None:
-
-            if crowd_level <= 2:
-
-                reasons.append(
-                    "low crowd level"
-                )
-
-            elif crowd_level >= 4:
-
-                reasons.append(
-                    "high crowd level"
-                )
-
-        # --------------------------------------------------------------------
-        # WAIT REASON
-        # --------------------------------------------------------------------
-
-        if wait_time is not None:
-
-            if wait_time <= 10:
-
-                reasons.append(
-                    "short waiting time"
-                )
-
-            elif wait_time >= 30:
-
-                reasons.append(
-                    "long expected wait"
-                )
-
-        # --------------------------------------------------------------------
-        # TREND REASON
-        # --------------------------------------------------------------------
-
-        if trend_name == "increasing":
-
-            reasons.append(
-                "crowds are increasing"
-            )
-
-        elif trend_name == "decreasing":
-
-            reasons.append(
-                "crowds are decreasing"
-            )
-
-        # --------------------------------------------------------------------
-        # ANOMALY REASON
-        # --------------------------------------------------------------------
-
-        if anomaly_detected:
-
-            reasons.append(
-                "unusual crowd activity detected"
-            )
-
-        return {
-
-            "decision":
-            decision,
-
-            "message":
-            message,
-
-            "reasons":
-            reasons,
-
-            "smart_score":
-            score
-
+            "available": bool(recommendations),
+            "count": len(recommendations),
+            "best_option": best_option,
+            "recommendations": recommendations
         }
